@@ -9,6 +9,8 @@ const tls = @import("tls.zig");
 
 const allocator = std.heap.page_allocator;
 
+threadlocal var stdout = std.io.bufferedWriter(std.io.getStdOut().writer());
+
 const Callbacks = struct {
     fn on_socket_create(
         client: *tls.Client,
@@ -48,17 +50,36 @@ const Callbacks = struct {
         result catch unreachable;
     }
 
-    fn on_write(_: *tls.Client, client: *tls.Client, completion: *Completion) void {
+    fn on_write(
+        _: *tls.Client,
+        completion: *Completion,
+        client: *tls.Client,
+        _: []const u8,
+        result: anyerror!usize,
+    ) void {
+        _ = result catch unreachable;
         allocator.free(completion.metadata.rw_const.base[0..completion.metadata.rw_const.len]);
 
         const buffer = allocator.alloc(u8, 2048) catch unreachable;
         client.read(completion, tls.Client, client, buffer, on_read);
     }
 
-    fn on_read(client: *tls.Client, completion: *Completion) void {
-        const slice = completion.metadata.rw.base[0..completion.metadata.rw.len];
+    fn on_read(
+        _: *tls.Client,
+        completion: *Completion,
+        client: *tls.Client,
+        slice: []u8,
+        result: error{EndOfStream}!usize,
+    ) void {
+        const len = result catch unreachable;
 
-        //std.debug.print("{s}\n", .{slice});
+        //std.debug.print("{s}\n", .{slice[0..len]});
+        //_ = stdout.writer().writeAll(slice[0..len]) catch unreachable;
+
+        if (len == 5) {
+            std.posix.exit(0);
+        }
+
         client.read(completion, tls.Client, client, slice, on_read);
     }
 };

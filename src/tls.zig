@@ -47,10 +47,11 @@ pub const Client = struct {
     write_comp: Completion = .{},
     /// Write completions but in order.
     /// NOTE: Partial writes are always handled.
+    /// NOTE: We don't take ownership of Transfers here, only borrowed.
     write_queue: jolt.Queue(Transfer) = .{},
     /// Read completion given by user to receive decrypted bytes.
-    /// NOTE: We don't own this completion.
-    user_read_comp: ?*Completion = null,
+    /// NOTE: We don't take ownership of this completion.
+    user_read_transfer: ?*Transfer = null,
     /// Invoked when handshake made.
     on_handshake: ?HandshakeFn = null,
     /// Internal state management.
@@ -71,7 +72,7 @@ pub const Client = struct {
         closed,
     };
 
-    /// Completions are turned into this; alignment and size is same as `jolt.Completion`.
+    /// Write completions are turned into this; alignment and size is same as `jolt.Completion`.
     /// NOTE: Configure this to work with IOCP when building jolt/io IOCP.
     const Transfer = extern struct {
         /// Intrusively linked to next transfer.
@@ -82,7 +83,8 @@ pub const Client = struct {
         callback: ?*const anyopaque = null,
         /// How much data transferred.
         transferred: usize = 0,
-        __pad0: u8 = 0,
+        /// This normally indicates operation type but here we use it to find out if we have errors.
+        is_eof: bool = false,
         /// Whether or not the completion is in the works.
         active: bool = false,
         /// This'll be given by compiler anyway, reserved here for future usage.
@@ -99,8 +101,8 @@ pub const Client = struct {
             },
         },
         /// Normally, this is used in `metadata` of `jolt.Completion` for string fd and flags.
-        /// Here we don't need this information.
-        __pad1: u64 = 0,
+        /// Here we use it store an additional userdata instead.
+        userdata0: ?*anyopaque = null,
 
         /// Type of type-erased `callback`.
         const Callback = *const fn (*Client, *Completion) void;
@@ -120,8 +122,9 @@ pub const Client = struct {
     /// Clients are unmanaged, meaning they don't own an `allocator`. Instead, allocator is required when doing certain operations.
     /// Returns an error if there isn't enough memory.
     pub fn init(allocator: std.mem.Allocator, loop: *Loop, sec_ctx: SecurityContext) error{OutOfMemory}!*Client {
-        // Allocate everything in one go.
         // NOTE: Alignment of Client must be same as []u8.
+        assert(@alignOf(Client) == @alignOf([]u8));
+        // Allocate everything in one go.
         const chunk = try allocator.alignedAlloc(u8, @alignOf(Client), chunk_size);
         errdefer allocator.free(chunk);
 
@@ -131,7 +134,7 @@ pub const Client = struct {
         // Init SSL and read/write BIO.
         // BIO we use for all TLS I/O.
         const rwbio = try bssl.bioNew(try Client.tlsMethod());
-        // TOOD: errdefer bssl.bioFree.
+        // TODO: errdefer bssl.bioFree.
         bssl.bioSetData(rwbio, @ptrCast(client)); // Attach Client to BIO.
         bssl.bioSetInit(rwbio, true); // Unless this is provided, BIO won't be initialized.
 
@@ -173,18 +176,18 @@ pub const Client = struct {
         return client;
     }
 
-    // TODO
     pub fn deinit(client: *Client, allocator: std.mem.Allocator) void {
+        bssl.sslFree(client.ssl);
+
         const chunk = @as([*]u8, @ptrCast(client))[0..chunk_size];
         allocator.free(chunk);
     }
 
     /// Runs the state machine once.
-    /// NOTE: This should be called after a successful I/O op (on_connect, on_recv, on_send etc.).
     fn step(client: *Client) void {
         sw: switch (client.state) {
-            // step cannot be called in unconnected state.
-            .unconnected => unreachable,
+            // step cannot be called in unconnected and closed state.
+            .unconnected, .closed => unreachable,
             .negotiating => {
                 bssl.sslDoHandshake(client.ssl) catch |err| switch (err) {
                     error.IoPending => return, // Retry later.
@@ -212,8 +215,9 @@ pub const Client = struct {
                             error.IoPending => break :write_loop,
                             else => {
                                 // This indicates write layer encountered an unrecoverable error.
-                                // We should likely empty write queue and invoke callbacks with failure.
-                                @panic("TODO");
+                                // Move on to closing state.
+                                client.state = .closing;
+                                continue :sw client.state;
                             },
                         };
 
@@ -223,31 +227,37 @@ pub const Client = struct {
 
                     _ = client.write_queue.pop();
 
-                    // Cast back to Completion from Transfer.
-                    const completion: *Completion = @ptrCast(node);
-                    // Operation finished.
-                    completion.active = false;
-                    // Give a type to completion callback and invoke.
-                    @call(.auto, @as(Transfer.Callback, @ptrCast(completion.callback)), .{ client, completion });
+                    // Invoke it on loop's completion queue, we want to have a predictable stack usage.
+                    client.sendTransferToLoop(node);
                 }
 
-                if (client.user_read_comp) |completion| {
-                    const slice = completion.metadata.rw.base[0..completion.metadata.rw.len];
-
-                    const transferred = bssl.sslRead(client.ssl, slice) catch |err| switch (err) {
-                        // Retry later.
-                        error.IoPending => return,
-                        else => @panic("TODO"),
+                // Handle read if requested.
+                if (client.user_read_transfer) |transfer| {
+                    const transferred = bssl.sslRead(client.ssl, transfer.sliceAt(0)) catch |err| switch (err) {
+                        error.IoPending => return, // Retry later.
+                        else => 0, // Handled in Transfer.callback.
                     };
 
-                    std.debug.print("{s}\n", .{completion.metadata.rw.base[0..transferred]});
+                    // No need to sum.
+                    transfer.transferred = transferred;
 
-                    client.user_read_comp = null;
-
-                    @call(.auto, @as(*const fn (*Client, *Completion) void, @ptrCast(completion.callback)), .{ client, completion });
+                    const completion: *Completion = @ptrCast(transfer);
+                    @call(.auto, @as(Completion.Callback, @ptrCast(completion.callback)), .{ client.loop, completion });
                 }
             },
-            .closing, .closed => @panic("TODO"),
+            .closing => {
+                // Empty write queue.
+                while (client.write_queue.pop()) |node| {
+                    node.is_eof = true;
+                    const completion: *Completion = @ptrCast(node);
+                    @call(.auto, @as(Completion.Callback, @ptrCast(completion.callback)), .{ client.loop, completion });
+                }
+
+                // TODO: If there's a read, fail it also.
+
+                // Move to closed state.
+                client.state = .closed;
+            },
         }
     }
 
@@ -303,7 +313,13 @@ pub const Client = struct {
         comptime T: type,
         userdata: *T,
         buffer: []const u8,
-        comptime on_done: *const fn (*T, *Client, *Completion) void,
+        comptime on_done: *const fn (
+            userdata: *T,
+            completion: *Completion,
+            client: *Client,
+            buffer: []const u8,
+            result: error{EndOfStream}!usize,
+        ) void,
     ) void {
         // Reinterpret as Transfer.
         const transfer: *Transfer = @ptrCast(completion);
@@ -312,8 +328,23 @@ pub const Client = struct {
             .next = null,
             .userdata = userdata,
             .callback = @ptrCast(&(struct {
-                fn wrap(_client: *Client, _completion: *Completion) void {
-                    @call(.always_inline, on_done, .{ _completion.userdatum(T), _client, _completion });
+                // This has to take *Loop as argument since this completion will be sent to event loop's
+                // completion queue. Event loop invokes each completion's callback with only these two arguments.
+                fn wrap(_: *Loop, _completion: *Completion) void {
+                    // Completion is free.
+                    _completion.active = false;
+                    // Transform to transfer.
+                    const _transfer: *Transfer = @ptrCast(_completion);
+                    // *Client is stored at userdata0.
+                    const _client: *Client = @ptrCast(@alignCast(_transfer.userdata0));
+
+                    @call(.always_inline, on_done, .{
+                        _completion.userdatum(T),
+                        _completion,
+                        _client,
+                        _transfer.sliceAt(0),
+                        if (_transfer.is_eof) error.EndOfStream else _transfer.transferred,
+                    });
                 }
             }).wrap),
             .transferred = 0,
@@ -324,12 +355,14 @@ pub const Client = struct {
                     .len = buffer.len,
                 },
             },
+            // Client stored here.
+            .userdata0 = client,
         };
 
         // perf: If this is the only node in wq, try to inline the operation.
         // NOTE: Its possible to do it in `negotiating` phase too thanks to FALSE_START.
         sw: switch (client.state) {
-            .unconnected => break :sw, // FALSE_START.
+            .unconnected => break :sw, // Can't inline here since raw_socket is not set.
             .negotiating, .negotiated => {
                 // Can't inline.
                 if (!client.write_queue.isEmpty()) break :sw;
@@ -346,19 +379,12 @@ pub const Client = struct {
                 }
 
                 // Operation finished.
-                completion.active = false;
-                @call(.auto, @as(Transfer.Callback, @ptrCast(completion.callback)), .{ client, completion });
-                return;
+                return client.sendTransferToLoop(transfer);
             },
-            .closing, .closed => {
-                // Operation cannot be done at this state.
-                completion.active = false;
-                @call(.auto, @as(Transfer.Callback, @ptrCast(completion.callback)), .{ client, completion });
-                return;
-            },
+            .closing, .closed => unreachable,
         }
 
-        // Can't inline, queue instead.
+        // Can't inline, put in write queue instead.
         client.write_queue.push(transfer);
     }
 
@@ -369,44 +395,69 @@ pub const Client = struct {
         comptime T: type,
         userdata: *T,
         slice: []u8,
-        comptime on_done: *const fn (*Client, *Completion) void,
+        comptime on_done: *const fn (
+            userdata: *T,
+            completion: *Completion,
+            client: *Client,
+            slice: []u8,
+            result: error{EndOfStream}!usize,
+        ) void,
     ) void {
-        assert(client.user_read_comp == null);
+        assert(client.user_read_transfer == null);
 
-        completion.* = .{
+        const transfer: *Transfer = @ptrCast(completion);
+
+        transfer.* = .{
+            .next = null,
             .userdata = userdata,
-            .operation = .recv,
             .callback = @ptrCast(&(struct {
-                fn wrap(_client: *Client, _completion: *Completion) void {
-                    _client.user_read_comp = null;
+                fn wrap(_: *Loop, _completion: *Completion) void {
+                    // Completion is free.
                     _completion.active = false;
+                    // Transform to transfer.
+                    const _transfer: *Transfer = @ptrCast(_completion);
+                    // *Client is stored at userdata0.
+                    const _client: *Client = @ptrCast(@alignCast(_transfer.userdata0));
+                    _client.user_read_transfer = null;
 
-                    on_done(_client, _completion);
+                    // Check if last read cause any errors.
+                    const res: error{EndOfStream}!usize = blk: {
+                        if (_client.read_comp.result < 0) break :blk error.EndOfStream;
+                        break :blk _transfer.transferred;
+                    };
+
+                    @call(.always_inline, on_done, .{
+                        _completion.userdatum(T),
+                        _completion,
+                        _client,
+                        _transfer.sliceAt(0),
+                        res,
+                    });
                 }
             }).wrap),
+            .transferred = 0,
             .active = true,
-            .metadata = .{
+            .data = .{
                 .rw = .{
                     .base = slice.ptr,
                     .len = slice.len,
-                    .fd = invalid_socket,
-                    .flags = 0,
                 },
             },
+            .userdata0 = client,
         };
-        client.user_read_comp = completion;
 
-        // Try reading.
+        client.user_read_transfer = transfer;
+
+        // Try inlining.
         const transferred = bssl.sslRead(client.ssl, slice) catch |err| switch (err) {
-            // Retry later.
-            error.IoPending => return,
-            else => @panic("TODO"),
+            error.IoPending => return, // Retry later.
+            else => 0, // Any other error is handled in Transfer.callback.
         };
 
-        std.debug.print("{s}\n", .{slice[0..transferred]});
-
-        // Inline success.
-        @call(.auto, @as(*const fn (*Client, *Completion) void, @ptrCast(completion.callback)), .{ client, completion });
+        // NOTE: This is the first time SSL_read called so no need to sum.
+        transfer.transferred = transferred;
+        // Operation completed inline.
+        @call(.auto, @as(Completion.Callback, @ptrCast(completion.callback)), .{ client.loop, completion });
     }
 
     /// Internal.
@@ -417,6 +468,12 @@ pub const Client = struct {
     /// Internal.
     inline fn getWriteCompletion(client: *Client) *Completion {
         return &client.write_comp;
+    }
+
+    /// Internal, sends a `*Transfer` to `jolt.Loop`.
+    fn sendTransferToLoop(client: *Client, transfer: *Transfer) void {
+        // TODO: Have a proper API in jolt/io to do this.
+        client.loop.completed.push(@ptrCast(transfer));
     }
 
     /// Internal, resets the position of `read_start`.
