@@ -57,7 +57,7 @@ pub fn sslDoHandshake(ssl: *c.SSL) SslError!void {
 }
 
 pub fn sslRead(ssl: *c.SSL, buffer: []u8) SslError!usize {
-    const e = c.SSL_read(ssl, @ptrCast(buffer.ptr), @intCast(buffer.len));
+    const e = c.SSL_read(ssl, @ptrCast(buffer.ptr), @intCast(buffer.len & std.math.maxInt(u31)));
     // Success.
     if (e > 0) {
         return @intCast(e);
@@ -68,7 +68,7 @@ pub fn sslRead(ssl: *c.SSL, buffer: []u8) SslError!usize {
 }
 
 pub fn sslWrite(ssl: *c.SSL, buffer: []const u8) SslError!usize {
-    const e = c.SSL_write(ssl, @ptrCast(buffer.ptr), @intCast(buffer.len));
+    const e = c.SSL_write(ssl, @ptrCast(buffer.ptr), @intCast(buffer.len & std.math.maxInt(u31)));
     // Success.
     if (e > 0) {
         return @intCast(e);
