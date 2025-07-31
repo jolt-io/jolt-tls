@@ -40,7 +40,7 @@ const Callbacks = struct {
             completion,
             tls.Client,
             client,
-            allocator.dupe(u8, "GET / HTTP/1.1\r\n\r\n") catch unreachable,
+            allocator.dupe(u8, "GET / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n") catch unreachable,
             on_write,
         );
     }
@@ -73,12 +73,10 @@ const Callbacks = struct {
     ) void {
         const len = result catch unreachable;
 
+        std.debug.print("{s}\n", .{slice[0..len]});
+
         //std.debug.print("{s}\n", .{slice[0..len]});
         //_ = stdout.writer().writeAll(slice[0..len]) catch unreachable;
-
-        if (len == 5) {
-            std.posix.exit(0);
-        }
 
         client.read(completion, tls.Client, client, slice, on_read);
     }

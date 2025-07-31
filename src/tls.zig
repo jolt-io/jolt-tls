@@ -1,6 +1,7 @@
 const std = @import("std");
 const os = std.os;
 const posix = std.posix;
+const linux = os.linux;
 const assert = std.debug.assert;
 const jolt = @import("jolt");
 const Loop = jolt.Loop;
@@ -19,6 +20,9 @@ const invalid_socket = if (is_windows) std.os.windows.ws2_32.INVALID_SOCKET else
 // Note that too small buffers will likely increase network operations.
 // https://github.com/chromium/chromium/blob/edc03b588da57ce59246a1cc5f2e0165a359dbc5/net/socket/ssl_client_socket_impl.cc#L82-L83
 const default_openssl_buffer_size = 17 * 1024;
+// Helps tracking the last network error.
+// We're surely fucked if 65535 is used as error code in some systems.
+const error_free: posix.E = @enumFromInt(std.math.maxInt(u16));
 
 /// TLS client implementation backed by BoringSSL.
 pub const Client = struct {
@@ -56,6 +60,9 @@ pub const Client = struct {
     on_handshake: ?HandshakeFn = null,
     /// Internal state management.
     state: State = .unconnected,
+    /// Last error received from completions.
+    /// Since operations happen in async, its better to keep this here for syncing.
+    last_err: posix.E = error_free,
 
     /// Connection state tracking.
     pub const State = enum {
@@ -104,9 +111,6 @@ pub const Client = struct {
         /// Here we use it store an additional userdata instead.
         userdata0: ?*anyopaque = null,
 
-        /// Type of type-erased `callback`.
-        const Callback = *const fn (*Client, *Completion) void;
-
         /// # SAFETY: Returned slice must be considered constant if `rw_const` was active.
         inline fn sliceAt(transfer: *Transfer, offset: usize) []u8 {
             return (transfer.data.rw.base + offset)[0 .. transfer.data.rw.len - offset];
@@ -123,7 +127,8 @@ pub const Client = struct {
     /// Returns an error if there isn't enough memory.
     pub fn init(allocator: std.mem.Allocator, loop: *Loop, sec_ctx: SecurityContext) error{OutOfMemory}!*Client {
         // NOTE: Alignment of Client must be same as []u8.
-        assert(@alignOf(Client) == @alignOf([]u8));
+        assert(@alignOf(Client) == @alignOf([]u8) and default_openssl_buffer_size > 0);
+
         // Allocate everything in one go.
         const chunk = try allocator.alignedAlloc(u8, @alignOf(Client), chunk_size);
         errdefer allocator.free(chunk);
@@ -131,10 +136,9 @@ pub const Client = struct {
         // Interpret first `@sizeOf(Client)` bytes as `Client`.
         const client: *Client = @ptrCast(chunk[0..@sizeOf(Client)]);
 
-        // Init SSL and read/write BIO.
-        // BIO we use for all TLS I/O.
+        // Init SSL and read/write BIO, we use the same BIO for all ops.
         const rwbio = try bssl.bioNew(try Client.tlsMethod());
-        // TODO: errdefer bssl.bioFree.
+        // TODO: errdefer bssl.bioFree?.
         bssl.bioSetData(rwbio, @ptrCast(client)); // Attach Client to BIO.
         bssl.bioSetInit(rwbio, true); // Unless this is provided, BIO won't be initialized.
 
@@ -187,15 +191,11 @@ pub const Client = struct {
     fn step(client: *Client) void {
         sw: switch (client.state) {
             // step cannot be called in unconnected and closed state.
-            .unconnected, .closed => unreachable,
+            .unconnected, .closing, .closed => unreachable,
             .negotiating => {
                 bssl.sslDoHandshake(client.ssl) catch |err| switch (err) {
                     error.IoPending => return, // Retry later.
-                    error.ZeroReturn, error.Syscall => {
-                        client.state = .closing;
-                        client.on_handshake.?(client, error.Closed);
-                    },
-                    else => unreachable,
+                    else => unreachable, // TODO
                 };
 
                 // If we got here, handshake completed successfully.
@@ -213,18 +213,22 @@ pub const Client = struct {
                         const written = bssl.sslWrite(client.ssl, node.sliceAt(node.transferred)) catch |err| switch (err) {
                             // Retry later.
                             error.IoPending => break :write_loop,
-                            else => {
-                                // This indicates write layer encountered an unrecoverable error.
-                                // Move on to closing state.
-                                client.state = .closing;
-                                continue :sw client.state;
+                            // Indicates TLS layer error, handled as EndOfStream currently.
+                            error.Internal => blk: {
+                                client.last_err = @enumFromInt(0); // EOF
+                                break :blk 0;
                             },
+                            error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
+                            // Other errors are unknown to be reachable; if we found a case where some of them possible
+                            // to get, we should also handle them.
+                            else => unreachable,
                         };
 
                         // Increment as much as written.
                         node.transferred += written;
                     }
 
+                    // Remove from queue now that write operation completed.
                     _ = client.write_queue.pop();
 
                     // Invoke it on loop's completion queue, we want to have a predictable stack usage.
@@ -235,28 +239,22 @@ pub const Client = struct {
                 if (client.user_read_transfer) |transfer| {
                     const transferred = bssl.sslRead(client.ssl, transfer.sliceAt(0)) catch |err| switch (err) {
                         error.IoPending => return, // Retry later.
-                        else => 0, // Handled in Transfer.callback.
+                        // Indicates TLS layer error, handled as EndOfStream currently.
+                        error.Internal => blk: {
+                            client.last_err = @enumFromInt(0);
+                            break :blk 0;
+                        },
+                        error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
+                        else => unreachable,
                     };
 
                     // No need to sum.
                     transfer.transferred = transferred;
 
+                    // Invoke read callback.
                     const completion: *Completion = @ptrCast(transfer);
                     @call(.auto, @as(Completion.Callback, @ptrCast(completion.callback)), .{ client.loop, completion });
                 }
-            },
-            .closing => {
-                // Empty write queue.
-                while (client.write_queue.pop()) |node| {
-                    node.is_eof = true;
-                    const completion: *Completion = @ptrCast(node);
-                    @call(.auto, @as(Completion.Callback, @ptrCast(completion.callback)), .{ client.loop, completion });
-                }
-
-                // TODO: If there's a read, fail it also.
-
-                // Move to closed state.
-                client.state = .closed;
             },
         }
     }
@@ -277,6 +275,7 @@ pub const Client = struct {
 
         // We don't use step here since we do a lot different things than a step.
         sw: switch (client.state) {
+            .negotiated, .closing, .closed => unreachable, // TODO
             .unconnected => {
                 // Setup client for the handshake.
                 client.on_handshake = on_done;
@@ -291,19 +290,15 @@ pub const Client = struct {
                         @branchHint(.likely);
                         return;
                     },
-                    error.ZeroReturn, error.Syscall => {
-                        client.state = .closing;
-                        continue :sw client.state;
-                    },
-                    else => unreachable,
+                    else => unreachable, // TODO
                 };
 
                 // We should never get here since read buffer must be empty when this called.
                 unreachable;
             },
-            .negotiated => client.on_handshake.?(client, error.AlreadyNegotiated),
-            .closing, .closed => client.on_handshake.?(client, error.Closed),
         }
+
+        unreachable;
     }
 
     /// Write to a TLS client, operation can be inlined if write queue is empty.
@@ -338,12 +333,18 @@ pub const Client = struct {
                     // *Client is stored at userdata0.
                     const _client: *Client = @ptrCast(@alignCast(_transfer.userdata0));
 
+                    const result: error{EndOfStream}!usize = blk: {
+                        if (_client.hasError()) break :blk error.EndOfStream;
+
+                        break :blk _transfer.transferred;
+                    };
+
                     @call(.always_inline, on_done, .{
                         _completion.userdatum(T),
                         _completion,
                         _client,
                         _transfer.sliceAt(0),
-                        if (_transfer.is_eof) error.EndOfStream else _transfer.transferred,
+                        result,
                     });
                 }
             }).wrap),
@@ -372,7 +373,15 @@ pub const Client = struct {
                     const written = bssl.sslWrite(client.ssl, transfer.sliceAt(transfer.transferred)) catch |err| switch (err) {
                         // Inlining failed or we got partial write, continue in queue.
                         error.IoPending => break :sw,
-                        else => @panic("TODO"),
+                        // Indicates TLS layer error, handled as EndOfStream currently.
+                        error.Internal => blk: {
+                            client.last_err = @enumFromInt(0); // EOF
+                            break :blk 0;
+                        },
+                        error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
+                        // Other errors are unknown to be reachable; if we found a case where some of them possible
+                        // to get, we should also handle them.
+                        else => unreachable,
                     };
 
                     transfer.transferred += written;
@@ -420,9 +429,13 @@ pub const Client = struct {
                     const _client: *Client = @ptrCast(@alignCast(_transfer.userdata0));
                     _client.user_read_transfer = null;
 
-                    // Check if last read cause any errors.
-                    const res: error{EndOfStream}!usize = blk: {
-                        if (_client.read_comp.result < 0) break :blk error.EndOfStream;
+                    // Check if we've any errors.
+                    // NOTE: Add more errors.
+                    const result: error{EndOfStream}!usize = blk: {
+                        if (_client.hasError()) {
+                            break :blk error.EndOfStream;
+                        }
+
                         break :blk _transfer.transferred;
                     };
 
@@ -431,7 +444,7 @@ pub const Client = struct {
                         _completion,
                         _client,
                         _transfer.sliceAt(0),
-                        res,
+                        result,
                     });
                 }
             }).wrap),
@@ -451,10 +464,16 @@ pub const Client = struct {
         // Try inlining.
         const transferred = bssl.sslRead(client.ssl, slice) catch |err| switch (err) {
             error.IoPending => return, // Retry later.
-            else => 0, // Any other error is handled in Transfer.callback.
+            // Indicates TLS layer error, handled as EndOfStream currently.
+            error.Internal => blk: {
+                client.last_err = @enumFromInt(0); // EOF
+                break :blk 0;
+            },
+            error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
+            else => unreachable,
         };
 
-        // NOTE: This is the first time SSL_read called so no need to sum.
+        // NOTE: No need to sum, we do a single SSL_read call and partial reads are not handled.
         transfer.transferred = transferred;
         // Operation completed inline.
         @call(.auto, @as(Completion.Callback, @ptrCast(completion.callback)), .{ client.loop, completion });
@@ -468,6 +487,11 @@ pub const Client = struct {
     /// Internal.
     inline fn getWriteCompletion(client: *Client) *Completion {
         return &client.write_comp;
+    }
+
+    /// Internal.
+    inline fn hasError(client: *const Client) bool {
+        return client.last_err != error_free;
     }
 
     /// Internal, sends a `*Transfer` to `jolt.Loop`.
@@ -522,17 +546,22 @@ pub const Client = struct {
                 ) void {
                     blk: {
                         // Don't handle the error here, it will be taken care of in bio_write.
-                        const written = result catch break :blk;
-                        // EOF, we never provide zero-length buffers.
-                        if (written == 0) break :blk;
+                        if (completion.result <= 0) {
+                            _client.last_err = @enumFromInt(-completion.result);
+                            break :blk;
+                        }
 
+                        // Safe, error is handled above.
+                        const written = result catch unreachable;
                         // Decrease as much as written.
                         _client.write_len -= written;
 
-                        // Move unwritten bytes to beginning.
-                        // NOTE: These two slices must not overlap.
+                        // Move remaining bytes to beginning.
                         const beginning = _client.write_start[0.._client.write_len];
-                        @memcpy(beginning, (_client.write_start + written)[0.._client.write_len]);
+                        const remaining = (_client.write_start + written)[0.._client.write_len];
+                        // NOTE: Slices have a chance to overlap so we cannot use memcpy here.
+                        // There are alternative ways to make this fifo without copying, might want to investigate.
+                        std.mem.copyForwards(u8, beginning, remaining);
 
                         // If there are bytes still, keep writing.
                         if (beginning.len > 0) {
@@ -551,15 +580,23 @@ pub const Client = struct {
     fn on_recv(
         client: *Client,
         _: *Loop,
-        _: *Completion,
+        completion: *Completion,
         _: Socket,
         _: []u8,
         result: Loop.RecvError!usize,
     ) void {
-        // Don't handle the error here, it will be taken care of in bio_read.
-        const transferred = result catch @as(usize, 0);
-        // Advance the read_len.
-        client.read_len += transferred;
+        blk: {
+            // Don't handle the error here, it will be taken care of in bio_read.
+            if (completion.result <= 0) {
+                client.last_err = @enumFromInt(-completion.result);
+                break :blk;
+            }
+
+            // Safe, error is caught above.
+            const transferred = result catch unreachable;
+            // Advance the read_len.
+            client.read_len += transferred;
+        }
 
         // Continue state machine.
         @call(.always_inline, step, .{client});
@@ -573,22 +610,19 @@ pub const Client = struct {
         bssl.bioClearRetryFlags(bio);
         const client = clientFromBio(bio);
 
-        // Check if the last recv completion failed.
+        // Check if any last op failed.
         //
         // BIO_read attempts to read len bytes into data.
         // It returns the number of bytes read, zero on EOF,
         // or a negative number on error.
-        const completion = client.getReadCompletion();
-        // NOTE: connect and close calls handle the errors in their respective callbacks.
-        // This one only cares errors that happened after successful negotiation.
-        //
-        // NOTE: We NEVER provide zero-sized buffers so result == 0 is just EOF.
-        if (completion.result <= 0 and completion.isPending() == false and client.state == .negotiated) {
-            return completion.result;
+        if (client.hasError()) {
+            return -1;
         }
 
         // If there's nothing in the read buffer, queue a read operation.
         if (client.read_len == 0) {
+            const completion = client.getReadCompletion();
+
             // Early return, recv is already pending.
             if (completion.isPending()) {
                 bssl.bioSetRetryRead(bio);
@@ -632,11 +666,12 @@ pub const Client = struct {
         bssl.bioClearRetryFlags(bio);
         const client = clientFromBio(bio);
 
-        // Handle previous send error if there was.
-        const completion = client.getWriteCompletion();
-        // NOTE: Make sure we never queue a zero-sized buffer.
-        if (completion.result <= 0 and completion.isPending() == false and client.state == .negotiated) {
-            return completion.result;
+        // Check if any last op failed.
+        //
+        // BIO_write writes len bytes from data to bio.
+        // It returns the number of bytes written or a negative number on error.
+        if (client.hasError()) {
+            return -1;
         }
 
         const available_space = default_openssl_buffer_size - client.write_len;
