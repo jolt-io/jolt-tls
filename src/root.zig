@@ -1,3 +1,5 @@
+//! Jolt TLS.
+
 const std = @import("std");
 const os = std.os;
 const posix = std.posix;
@@ -8,10 +10,12 @@ const Loop = jolt.Loop;
 const Completion = Loop.Completion;
 const Socket = Loop.Socket;
 const bssl = @import("wrapper/boringssl.zig");
-const SecurityContext = @import("SecurityContext.zig");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
+
+// Expose SecurityContext.
+pub const SecurityContext = @import("SecurityContext.zig");
 
 // On Windows, all file descriptors are pointers instead of i32.
 // TODO: Move this to jolt/io instead.
@@ -732,3 +736,116 @@ pub const Client = struct {
         return meth;
     }
 };
+
+const testing = std.testing;
+
+test {
+    testing.refAllDecls(@This());
+}
+
+test "Simple request, write a proper test" {
+    const allocator = std.testing.allocator;
+
+    const Callbacks = struct {
+        fn on_socket_create(
+            client: *Client,
+            loop: *Loop,
+            completion: *Completion,
+            result: Loop.SocketError!Loop.Socket,
+        ) void {
+            const socket = result catch unreachable;
+            client.setSocket(socket);
+
+            const addr = std.net.Address.initIp4(.{ 142, 250, 184, 142 }, 443);
+            loop.connect(completion, Client, client, socket, addr, on_connect);
+        }
+
+        fn on_connect(
+            client: *Client,
+            _: *Loop,
+            completion: *Completion,
+            _: Loop.Socket,
+            _: std.net.Address,
+            result: Loop.ConnectError!void,
+        ) void {
+            result catch unreachable;
+
+            client.handshake(on_handshake);
+            client.write(
+                completion,
+                Client,
+                client,
+                allocator.dupe(u8, "GET / HTTP/1.1\r\n\r\n") catch unreachable,
+                on_write,
+            );
+        }
+
+        fn on_handshake(client: *Client, result: anyerror!void) void {
+            _ = client;
+            result catch unreachable;
+        }
+
+        fn on_write(
+            _: *Client,
+            completion: *Completion,
+            client: *Client,
+            slice: []const u8,
+            result: anyerror!usize,
+        ) void {
+            defer allocator.free(slice);
+            _ = result catch unreachable;
+
+            const buffer = allocator.alloc(u8, 2048) catch unreachable;
+            client.read(completion, Client, client, buffer, on_read);
+        }
+
+        fn on_read(
+            _: *Client,
+            _: *Completion,
+            _: *Client,
+            slice: []u8,
+            result: error{EndOfStream}!usize,
+        ) void {
+            defer allocator.free(slice);
+            const len = result catch unreachable;
+
+            std.debug.print("{s}\n", .{slice[0..len]});
+
+            //std.debug.print("{s}\n", .{slice[0..len]});
+            //_ = stdout.writer().writeAll(slice[0..len]) catch unreachable;
+        }
+    };
+
+    const sec_ctx = try SecurityContext.init();
+
+    var loop = try Loop.init();
+    defer loop.deinit();
+
+    const client = try Client.init(allocator, &loop, sec_ctx);
+    defer client.deinit(allocator);
+
+    var completion = Completion{};
+
+    loop.openSocket(
+        &completion,
+        Client,
+        client,
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM,
+        0,
+        0,
+        Callbacks.on_socket_create,
+    );
+
+    // TODO
+    // An atomically reference counted, mutex-locked TLS client.
+    // Can be shared across threads and submit operations in parallel.
+    // Note that completion callbacks will still be emitted in the loop (main) thread.
+    // tls.Client(.shared)
+    //
+    // Non-atomic TLS client.
+    // Cannot be shared across threads, only a single thread can submit operations.
+    // tls.Client(.unshared)
+
+    try loop.run();
+}
