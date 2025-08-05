@@ -53,12 +53,12 @@ pub const Client = struct {
     read_comp: Completion = .{},
     /// Completion for write operations.
     write_comp: Completion = .{},
-    /// Write completions but in order.
+    /// Write completion given by user to write encrypted bytes.
     /// NOTE: Partial writes are always handled.
-    /// NOTE: We don't take ownership of Transfers here, only borrowed.
-    write_queue: jolt.Queue(Transfer) = .{},
+    /// NOTE: We only borrow this completion.
+    user_write_transfer: ?*Transfer = null,
     /// Read completion given by user to receive decrypted bytes.
-    /// NOTE: We don't take ownership of this completion.
+    /// NOTE: We only borrow this completion.
     user_read_transfer: ?*Transfer = null,
     /// Invoked when handshake made.
     on_handshake: ?HandshakeFn = null,
@@ -210,33 +210,34 @@ pub const Client = struct {
             },
             // This is where implicit negotiations and application data transfers happen.
             .negotiated => {
-                // We try to drain everything in the wq.
-                var _node = client.write_queue.head;
-                write_loop: while (_node) |node| : (_node = client.write_queue.head) {
-                    while (node.transferred < node.data.rw_const.len) {
-                        const written = bssl.sslWrite(client.ssl, node.sliceAt(node.transferred)) catch |err| switch (err) {
-                            // Retry later.
-                            error.IoPending => break :write_loop,
-                            // Indicates TLS layer error, handled as EndOfStream currently.
-                            error.Internal => blk: {
-                                client.last_err = @enumFromInt(0); // EOF
-                                break :blk 0;
-                            },
-                            error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
-                            // Other errors are unknown to be reachable; if we found a case where some of them possible
-                            // to get, we should also handle them.
-                            else => unreachable,
-                        };
+                // Handle write if requested.
+                write_blk: {
+                    if (client.user_write_transfer) |transfer| {
+                        while (transfer.transferred < transfer.data.rw_const.len) {
+                            const written = bssl.sslWrite(client.ssl, transfer.sliceAt(transfer.transferred)) catch |err| switch (err) {
+                                error.IoPending => break :write_blk, // Retry later.
+                                // Indicates TLs layer error, handled as EndOfStream currently.
+                                error.Internal => blk: {
+                                    client.last_err = @enumFromInt(0); // EOF
+                                    break :blk 0;
+                                },
+                                error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
+                                // Other errors are unknown to be reachable; if we found a case where some of them possible
+                                // to get, we should also handle them.
+                                else => unreachable,
+                            };
 
-                        // Increment as much as written.
-                        node.transferred += written;
+                            // Advance.
+                            transfer.transferred += written;
+                        }
+
+                        // Invoke it on loop's completion queue, we do this for;
+                        // * predictable stack usage,
+                        // * consistency when completions completed.
+                        //
+                        // NOTE: If we don't see a benefit of it, we can just invoke the callback here.
+                        client.sendTransferToLoop(transfer);
                     }
-
-                    // Remove from queue now that write operation completed.
-                    _ = client.write_queue.pop();
-
-                    // Invoke it on loop's completion queue, we want to have a predictable stack usage.
-                    client.sendTransferToLoop(node);
                 }
 
                 // Handle read if requested.
@@ -305,7 +306,8 @@ pub const Client = struct {
         unreachable;
     }
 
-    /// Write to a TLS client, operation can be inlined if write queue is empty.
+    /// Write to a TLS client, operation will be inlined if possible. Hence the reason this function can return results.
+    /// NOTE: Only a single write completion can be active at a time.
     pub fn write(
         client: *Client,
         completion: *Completion,
@@ -319,7 +321,7 @@ pub const Client = struct {
             buffer: []const u8,
             result: error{EndOfStream}!usize,
         ) void,
-    ) void {
+    ) !usize {
         // Reinterpret as Transfer.
         const transfer: *Transfer = @ptrCast(completion);
 
@@ -364,41 +366,30 @@ pub const Client = struct {
             .userdata0 = client,
         };
 
-        // perf: If this is the only node in wq, try to inline the operation.
-        // NOTE: Its possible to do it in `negotiating` phase too thanks to FALSE_START.
-        sw: switch (client.state) {
-            .unconnected => break :sw, // Can't inline here since raw_socket is not set.
-            .negotiating, .negotiated => {
-                // Can't inline.
-                if (!client.write_queue.isEmpty()) break :sw;
+        // Try inlining.
+        while (transfer.transferred < buffer.len) {
+            const written = bssl.sslWrite(client.ssl, transfer.sliceAt(transfer.transferred)) catch |err| switch (err) {
+                error.IoPending => {
+                    // Either cannot be inlined or we have a partial write.
+                    // Operation will be completed in the future.
+                    client.user_write_transfer = transfer;
+                    return err;
+                },
+                error.Internal => {
+                    client.last_err = @enumFromInt(0); // EOF.
+                    return error.EndOfStream;
+                },
+                error.Syscall => return error.EndOfStream,
+                else => unreachable,
+            };
 
-                // Try to write everything.
-                while (transfer.transferred < transfer.data.rw_const.len) {
-                    const written = bssl.sslWrite(client.ssl, transfer.sliceAt(transfer.transferred)) catch |err| switch (err) {
-                        // Inlining failed or we got partial write, continue in queue.
-                        error.IoPending => break :sw,
-                        // Indicates TLS layer error, handled as EndOfStream currently.
-                        error.Internal => blk: {
-                            client.last_err = @enumFromInt(0); // EOF
-                            break :blk 0;
-                        },
-                        error.Syscall => 0, // Indicates transport layer error, handled in Completion.Callback.
-                        // Other errors are unknown to be reachable; if we found a case where some of them possible
-                        // to get, we should also handle them.
-                        else => unreachable,
-                    };
-
-                    transfer.transferred += written;
-                }
-
-                // Operation finished.
-                return client.sendTransferToLoop(transfer);
-            },
-            .closing, .closed => unreachable,
+            // Advance transferred.
+            transfer.transferred += written;
         }
 
-        // Can't inline, put in write queue instead.
-        client.write_queue.push(transfer);
+        // Not active since operation inlined.
+        transfer.active = false;
+        return transfer.transferred;
     }
 
     /// Queues a read operation. Only a single read completion can be active at a time.
@@ -769,20 +760,27 @@ test "Simple request, write a proper test" {
             result: Loop.ConnectError!void,
         ) void {
             result catch unreachable;
+            _ = completion;
 
             client.handshake(on_handshake);
-            client.write(
-                completion,
-                Client,
-                client,
-                allocator.dupe(u8, "GET / HTTP/1.1\r\n\r\n") catch unreachable,
-                on_write,
-            );
         }
 
         fn on_handshake(client: *Client, result: anyerror!void) void {
-            _ = client;
             result catch unreachable;
+
+            var c = Completion{};
+            const slice = allocator.dupe(u8, "GET / HTTP/1.1\r\n\r\n") catch unreachable;
+            defer allocator.free(slice);
+
+            const transferred = client.write(
+                &c,
+                Client,
+                client,
+                slice,
+                on_write,
+            ) catch unreachable;
+
+            std.debug.print("written {} bytes\n", .{transferred});
         }
 
         fn on_write(
@@ -794,9 +792,11 @@ test "Simple request, write a proper test" {
         ) void {
             defer allocator.free(slice);
             _ = result catch unreachable;
+            _ = completion;
+            _ = client;
 
-            const buffer = allocator.alloc(u8, 2048) catch unreachable;
-            client.read(completion, Client, client, buffer, on_read);
+            //const buffer = allocator.alloc(u8, 2048) catch unreachable;
+            //client.read(completion, Client, client, buffer, on_read);
         }
 
         fn on_read(
