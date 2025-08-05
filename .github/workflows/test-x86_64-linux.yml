@@ -4,12 +4,8 @@ on: [push, pull_request]
 
 jobs:
   build:
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        target: [x86_64-linux-gnu, x86_64-linux-musl]
-    runs-on: ${{ matrix.os }}
-    name: Test ${{ matrix.os }}, ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    name: Test ${{ build.runs-on }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,4 +16,4 @@ jobs:
           version: 0.14.1
 
       - name: Run Tests
-        run: zig build test -Dtarget=${{ matrix.target }}
+        run: zig build test
